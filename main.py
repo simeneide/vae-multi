@@ -36,7 +36,7 @@ cb_checkpoint = ModelCheckpoint(monitor='val/loss', verbose=True, save_last=True
 trainer = pl.Trainer(
     gpus=1, 
     #auto_lr_find=True,
-    logger = TensorBoardLogger('lightning_logs', name='coco'),
+    logger = TensorBoardLogger('lightning_logs', name='coco-withtext'),
     callbacks=[cb_imageplot],
     checkpoint_callback=cb_checkpoint)
 

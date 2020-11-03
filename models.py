@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from pl_bolts.models.autoencoders.components import resnet18_encoder, resnet18_decoder
 from pl_bolts.models.autoencoders.components import resnet50_encoder, resnet50_decoder
 
+
 class LabelDecoder(nn.Module):
     """ 
     Simple module that takes the latent vector as input and outputes logits of each class.
@@ -103,6 +104,26 @@ class LabelEncoder(nn.Module):
         var = torch.exp(self.classemb_var(label))
         return mu, var
 
+import transformers
+class TextEncoder(nn.Module):
+    def __init__(self, latent_dim):
+        super(TextEncoder, self).__init__()
+        self.transformer = transformers.BertForSequenceClassification.from_pretrained(
+                            "bert-base-multilingual-uncased",
+                            num_labels = 200,
+                            output_attentions = False,
+                            output_hidden_states = False
+                        )
+        self.drop = nn.Dropout(0.1)
+        self.mu_fc = nn.Linear(self.transformer.classifier.out_features, latent_dim)
+        self.var_fc = nn.Linear(self.transformer.classifier.out_features, latent_dim)
+
+    def forward(self, text):
+        logits = self.transformer(text)[0]
+        mu = self.mu_fc(logits)
+        var = torch.exp(self.var_fc(logits))
+        return mu, var
+
 class VAE(pl.LightningModule):
     """
     Modular VAE where you can add multiple generators/discriminators.
@@ -145,6 +166,7 @@ class VAE(pl.LightningModule):
         # Define what encoders to use:
         self.encoders_func = nn.ModuleDict({})
         self.encoders_func['image'] = ImageEncoder(latent_dim=latent_dim)
+        self.encoders_func['text'] = TextEncoder(latent_dim=latent_dim)
         #self.encoders_func['label'] = LabelEncoder(num_labels=num_labels, latent_dim=latent_dim)
         
         # Define the decoders:
@@ -160,8 +182,8 @@ class VAE(pl.LightningModule):
         # switch to dict batch:
         one_var = next(iter(batch.values()))
         batch_size = len(one_var)
-        mu_tot = torch.zeros( (batch_size, self.latent_dim)).type_as(one_var)
-        var_tot = torch.zeros( (batch_size, self.latent_dim)).type_as(one_var)
+        mu_tot = torch.zeros( (batch_size, self.latent_dim)).to(self.device)
+        var_tot = torch.zeros( (batch_size, self.latent_dim)).to(self.device)
         weight_tot = 1e-10
 
         # Encode all data attributes and add as indep gaussians:
@@ -187,8 +209,9 @@ class VAE(pl.LightningModule):
     def forward(self, batch):
         out = self.encoder(batch)
 
-        # Decode:
+        # Generate data (decode)
         gen_data = self.decoder(out['z_sample'])
+        # Add to output dict
         for key, val in gen_data.items():
             out[key] = val
         return out
@@ -200,8 +223,6 @@ class VAE(pl.LightningModule):
         return {'dist_prior' : p, 'dist_post' : q, 'z_sample' :z}
 
     def step(self, batch, batch_idx):
-        #x, y = batch
-        #batch = {'image' : x, 'label' : y}
         out = self.forward(batch)
         loss_components = {}
         
