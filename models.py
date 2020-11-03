@@ -8,37 +8,110 @@ from torch.nn import functional as F
 from pl_bolts.models.autoencoders.components import resnet18_encoder, resnet18_decoder
 from pl_bolts.models.autoencoders.components import resnet50_encoder, resnet50_decoder
 
+class LabelDecoder(nn.Module):
+    """ 
+    Simple module that takes the latent vector as input and outputes logits of each class.
+    Can be extended with multiple layers or other loss.
+    
+    """
+    def __init__(self, num_labels, latent_dim):
+        super().__init__()
+
+        self.num_labels = num_labels
+        self.latent_dim = latent_dim
+
+        self.linear = nn.Linear(self.latent_dim, self.num_labels)
+    def forward(self, z):
+        return self.linear(z)
+
+    def loss(self, yhat, obs):
+        loss = F.cross_entropy(yhat, obs)
+        return loss
+
+class ImageDecoder(nn.Module):
+    """ resnet decoder """
+    def __init__(
+        self, 
+        latent_dim: int, 
+        input_height: int,
+        first_conv: bool = False,
+        maxpool1: bool = False,
+        model_type: str = 'resnet18'
+        ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.input_height = input_height
+
+        valid_decoders = {
+            'resnet18': resnet18_decoder,
+            'resnet50': resnet50_decoder
+        }
+        self.decoder = valid_decoders[model_type](self.latent_dim, self.input_height, first_conv, maxpool1)
+    
+    def forward(self, z):
+        return self.decoder(z)
+    
+    def loss(self, yhat, obs):
+        loss = F.mse_loss(yhat, obs)
+        return loss
+
+class ImageEncoder(nn.Module):
+    """ resnet encoder """
+    def __init__(
+        self, 
+        latent_dim: int, 
+        enc_out_dim: int = 512,
+        first_conv: bool = False,
+        maxpool1: bool = False,
+        model_type: str = 'resnet18'
+        ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.enc_out_dim = enc_out_dim
+
+        valid_encoders = {
+            'resnet18': resnet18_encoder,
+            'resnet50': resnet50_encoder
+        }
+        self.encoder = valid_encoders[model_type](first_conv, maxpool1)
+        self.fc_mu = nn.Linear(self.enc_out_dim, self.latent_dim)
+        self.fc_var = nn.Linear(self.enc_out_dim, self.latent_dim)
+    
+    def forward(self, img):
+        x = self.encoder(img)
+        mu = self.fc_mu(x)
+        var = torch.exp(self.fc_var(x))
+        return mu, var
+
+class LabelEncoder(nn.Module):
+    """ 
+    Simple module that takes the latent vector as input and outputes logits of each class.
+    Can be extended with multiple layers or other loss.
+    
+    """
+    def __init__(self, num_labels, latent_dim):
+        super().__init__()
+
+        self.num_labels = num_labels
+        self.latent_dim = latent_dim
+
+        self.classemb_mu = nn.Embedding(self.num_labels, embedding_dim=self.latent_dim)
+        self.classemb_var = nn.Embedding(self.num_labels, embedding_dim=self.latent_dim)
+    
+    def forward(self, label):
+        mu = self.classemb_mu(label)
+        var = torch.exp(self.classemb_var(label))
+        return mu, var
 
 class VAE(pl.LightningModule):
     """
-    Standard VAE with Gaussian Prior and approx posterior.
-
-    Model is available pretrained on different datasets:
-
-    Example::
-
-        # not pretrained
-        vae = VAE()
-
-        # pretrained on cifar10
-        vae = VAE.from_pretrained('cifar10-resnet18')
-
-        # pretrained on stl10
-        vae = VAE.from_pretrained('stl10-resnet18')
+    Modular VAE where you can add multiple generators/discriminators.
     """
-
-    pretrained_urls = {
-        'cifar10-resnet18':
-            'https://pl-bolts-weights.s3.us-east-2.amazonaws.com/vae/vae-cifar10/checkpoints/epoch%3D89.ckpt',
-        'stl10-resnet18':
-            'https://pl-bolts-weights.s3.us-east-2.amazonaws.com/vae/vae-stl10/checkpoints/epoch%3D89.ckpt'
-    }
 
     def __init__(
         self,
         input_height: int,
-        num_classes= int,
-        use_label: bool = False,
+        num_labels= int,
         enc_type: str = 'resnet18',
         first_conv: bool = False,
         maxpool1: bool = False,
@@ -47,7 +120,7 @@ class VAE(pl.LightningModule):
         latent_dim: int = 256,
         lr: float = 1e-4,
         **kwargs
-    ):
+        ):
         """
         Args:
             input_height: height of the images
@@ -61,134 +134,94 @@ class VAE(pl.LightningModule):
             latent_dim: dim of latent space
             lr: learning rate for Adam
         """
-
         super(VAE, self).__init__()
-
         self.save_hyperparameters()
-
         self.lr = lr
         self.kl_coeff = kl_coeff
         self.enc_out_dim = enc_out_dim
         self.latent_dim = latent_dim
         self.input_height = input_height
 
-
-        # Image ENC/DEC
-        valid_encoders = {
-            'resnet18': {'enc': resnet18_encoder, 'dec': resnet18_decoder},
-            'resnet50': {'enc': resnet50_encoder, 'dec': resnet50_decoder},
-        }
-
-        self.encoder = valid_encoders[enc_type]['enc'](first_conv, maxpool1)
-        self.decoder = valid_encoders[enc_type]['dec'](self.latent_dim, self.input_height, first_conv, maxpool1)
-
-        self.fc_mu = nn.Linear(self.enc_out_dim, self.latent_dim)
-        self.fc_var = nn.Linear(self.enc_out_dim, self.latent_dim)
-
-        # Label ENC/DEC
-        self.register_parameter("w",nn.Parameter(torch.tensor([0.5])))
-        self.use_label = use_label
-        self.num_classes = num_classes
-        self.classemb_mu = nn.Embedding(self.num_classes, embedding_dim=self.latent_dim)
-        self.classemb_var = nn.Embedding(self.num_classes, embedding_dim=self.latent_dim)
-        self.decoder_class = nn.Linear(self.latent_dim, self.num_classes)
-
-    @staticmethod
-    def pretrained_weights_available():
-        return list(VAE.pretrained_urls.keys())
-
-    def from_pretrained(self, checkpoint_name):
-        if checkpoint_name not in VAE.pretrained_urls:
-            raise KeyError(str(checkpoint_name) + ' not present in pretrained weights.')
-
-        return self.load_from_checkpoint(VAE.pretrained_urls[checkpoint_name], strict=False)
-
-    def forward(self, x, y=None):
-        # Image
-        x = self.encoder(x)
-        mu_img = self.fc_mu(x)
-        var_img = torch.exp(self.fc_var(x))
+        # Define what encoders to use:
+        self.encoders_func = nn.ModuleDict({})
+        self.encoders_func['image'] = ImageEncoder(latent_dim=latent_dim)
+        #self.encoders_func['label'] = LabelEncoder(num_labels=num_labels, latent_dim=latent_dim)
         
-        # label
-        if self.use_label:
-            mu_label = self.classemb_mu(y)
-            var_label = torch.exp(self.classemb_var(y))
+        # Define the decoders:
+        self.decoders_func = nn.ModuleDict({})
+        self.decoders_func['image'] = ImageDecoder(latent_dim=latent_dim, input_height=input_height)
+        #self.decoders_func['label'] = LabelDecoder(num_labels=num_labels, latent_dim=latent_dim)
 
-            w1 = nn.Sigmoid()(self.w)
-            w2 = 1.0 - w1
+        # Weigh the encoders:
+        self.enc2idx = {name : i for i, name in enumerate(self.encoders_func.keys())}
+        self.register_parameter("weight_enc",nn.Parameter(torch.ones((len(self.enc2idx))) ))
 
-            mu = (w2*mu_label + w1*mu_img)
-            std = ((w1**2 * var_img + w2**2 *var_label)).sqrt()
-        else:
-            mu = mu_img
-            std = var_img.sqrt()
-        p, q, z = self.sample(mu, std)
+    def encoder(self, batch):
+        # switch to dict batch:
+        one_var = next(iter(batch.values()))
+        batch_size = len(one_var)
+        mu_tot = torch.zeros( (batch_size, self.latent_dim)).type_as(one_var)
+        var_tot = torch.zeros( (batch_size, self.latent_dim)).type_as(one_var)
+        weight_tot = 1e-10
 
-        out = {
-            'label' : self.decoder_class(z),
-            'image' : self.decoder(z)
-            }
-
+        # Encode all data attributes and add as indep gaussians:
+        for key, x in batch.items():
+            mu, var = self.encoders_func[key](x)
+            w = self.weight_enc[self.enc2idx[key]]
+            mu_tot += mu*w
+            var_tot += var* w**2
+            weight_tot += w
+        
+        mu_tot = mu_tot/weight_tot
+        std_tot = (var_tot/weight_tot).sqrt()
+        out = self.sample(mu_tot, std_tot)
         return out
 
-    def _run_step(self, x, y=None):
-        # Image
-        x = self.encoder(x)
-        mu_img = self.fc_mu(x)
-        var_img = torch.exp(self.fc_var(x))
-        
-        # label
-        if self.use_label:
-            mu_label = self.classemb_mu(y)
-            var_label = torch.exp(self.classemb_var(y))
+    def decoder(self, z):
+        """ Given a latent vector z, generate all data types."""
+        data = {}
+        for key, decoder in self.decoders_func.items():
+            data[key] = decoder(z)
+        return data
 
-            w1 = nn.Sigmoid()(self.w)
-            w2 = 1.0 -w1
+    def forward(self, batch):
+        out = self.encoder(batch)
 
-            mu = (w2*mu_label + w1*mu_img)
-            std = ((w1**2 * var_img + w2**2 * var_label)).sqrt()
-            #mu = 0.5*(mu_label + mu_img)
-            #std = (0.5*(var_img + var_label)).sqrt()
-        else:
-            mu = mu_img
-            std = var_img.sqrt()
-        p, q, z = self.sample(mu, std)
-        out = {
-            'p' : p,
-            'q' : q,
-            'z' : z,
-            'label' : self.decoder_class(z),
-            'image' : self.decoder(z)
-            }
+        # Decode:
+        gen_data = self.decoder(out['z_sample'])
+        for key, val in gen_data.items():
+            out[key] = val
         return out
 
     def sample(self, mu, std):
         p = torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(std))
         q = torch.distributions.Normal(mu, std)
         z = q.rsample()
-        return p, q, z
+        return {'dist_prior' : p, 'dist_post' : q, 'z_sample' :z}
 
     def step(self, batch, batch_idx):
-        x, y = batch
-        out = self._run_step(x, y)
-
-        image_loss = F.mse_loss(out['image'], x, reduction='mean')
-        label_loss = F.cross_entropy(out['label'], y)
-
-        log_qz = out['q'].log_prob(out['z'])
-        log_pz = out['p'].log_prob(out['z'])
-
+        #x, y = batch
+        #batch = {'image' : x, 'label' : y}
+        out = self.forward(batch)
+        loss_components = {}
+        
+        # Likelihood loss:
+        for key, dec in self.decoders_func.items():
+            loss_components[f"loss_{key}"] = dec.loss(out[key], batch[key])
+        
+        # KL Loss:
+        log_qz = out['dist_post'].log_prob(out['z_sample'])
+        log_pz = out['dist_prior'].log_prob(out['z_sample'])
         kl = log_qz - log_pz
-        kl = kl.mean()
+        loss_components['kl'] = kl.mean()
+        
+        # Sum the losses:
+        loss = 0
+        for key, val in loss_components.items():
+            loss += val
 
-        loss = kl + image_loss + label_loss
-
-        logs = {
-            "image_loss": image_loss,
-            "label_loss" : label_loss,
-            "kl": kl,
-            "loss": loss,
-        }
+        logs = loss_components
+        logs['loss'] = loss
         return loss, logs
 
     def training_step(self, batch, batch_idx):
@@ -196,7 +229,7 @@ class VAE(pl.LightningModule):
         self.log_dict(
             {f"train/{k}": v for k, v in logs.items()}, on_step=True, on_epoch=False
         )
-        self.log("param/weight", value=self.w)
+        self.log("param/weight", value=self.weight_enc.abs().mean())
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -207,69 +240,10 @@ class VAE(pl.LightningModule):
 
     def configure_optimizers(self):
         #return torch.optim.SGD(self.parameters(), lr = self.lr)
-        return OptimizerSGHMC(net=self,alpha = self.lr, nu=0.9, sgmcmc=False)
-        #return torch.optim.Adam(self.parameters(), lr=self.lr)
-
-    @staticmethod
-    def add_model_specific_args(parent_parser):
-        parser = ArgumentParser(parents=[parent_parser], add_help=False)
-
-        parser.add_argument("--enc_type", type=str, default='resnet18', help="resnet18/resnet50")
-        parser.add_argument("--first_conv", action='store_true')
-        parser.add_argument("--maxpool1", action='store_true')
-        parser.add_argument("--lr", type=float, default=1e-4)
-
-        parser.add_argument(
-            "--enc_out_dim", type=int, default=512,
-            help="512 for resnet18, 2048 for bigger resnets, adjust for wider resnets"
-        )
-        parser.add_argument("--kl_coeff", type=float, default=0.1)
-        parser.add_argument("--latent_dim", type=int, default=256)
-
-        parser.add_argument("--batch_size", type=int, default=256)
-        parser.add_argument("--num_workers", type=int, default=8)
-        parser.add_argument("--data_dir", type=str, default=".")
-
-        return parser
-
-    
-def cli_main(args=None):
-    from pl_bolts.datamodules import CIFAR10DataModule, ImagenetDataModule, STL10DataModule
-
-    pl.seed_everything()
-
-    parser = ArgumentParser()
-    parser.add_argument("--dataset", default="cifar10", type=str, choices=["cifar10", "stl10", "imagenet"])
-    script_args, _ = parser.parse_known_args(args)
-
-    if script_args.dataset == "cifar10":
-        dm_cls = CIFAR10DataModule
-    elif script_args.dataset == "stl10":
-        dm_cls = STL10DataModule
-    elif script_args.dataset == "imagenet":
-        dm_cls = ImagenetDataModule
-    else:
-        raise ValueError(f"undefined dataset {script_args.dataset}")
-
-    parser = VAE.add_model_specific_args(parser)
-    parser = pl.Trainer.add_argparse_args(parser)
-    args = parser.parse_args(args)
-
-    dm = dm_cls.from_argparse_args(args)
-    args.input_height = dm.size()[-1]
-
-    if args.max_steps == -1:
-        args.max_steps = None
-
-    model = VAE(**vars(args))
-
-    trainer = pl.Trainer.from_argparse_args(args)
-    trainer.fit(model, dm)
-    return dm, model, trainer
-
+        #return OptimizerSGHMC(net=self,alpha = self.lr, nu=0.9, sgmcmc=False)
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 from torch.optim.optimizer import Optimizer
-
 class OptimizerSGHMC(Optimizer):
     def __init__(self, net, alpha=1e-4, nu=1.0, sgmcmc=True):
         super(OptimizerSGHMC, self).__init__(net.parameters(), {})
@@ -292,7 +266,3 @@ class OptimizerSGHMC(Optimizer):
             if self.sgmcmc:
                 noise = torch.normal(torch.zeros_like(self.momentum[name]), std=self.noise_std)
                 self.momentum[name] += noise
-
-
-if __name__ == "__main__":
-    dm, model, trainer = cli_main()
